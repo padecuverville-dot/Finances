@@ -540,12 +540,12 @@
       <div class="brand-sub" id="data-range">— transactions chargées</div>
     </div>
     <div class="header-actions">
-      <input type="file" id="file-input" class="file-input" accept=".xlsx,.xls,.csv">
+      <input type="file" id="file-input" class="file-input" accept=".xlsx,.xls,.csv" multiple>
       <button class="btn" id="reset-btn" onclick="if(confirm('Effacer les données importées et revenir au jeu de démonstration ?')) resetData();" style="display:none">
         ↺ Reset
       </button>
-      <button class="btn" onclick="document.getElementById('file-input').click()">
-        ↑ Importer un nouveau relevé
+      <button class="btn" onclick="document.getElementById('file-input').click()" title="Ajoute un ou plusieurs relevés (XLSX ou CSV). Multi-banques supporté, doublons éliminés.">
+        ↑ Ajouter un relevé
       </button>
       <button class="btn btn-primary" onclick="exportData()">
         ↓ Exporter
@@ -1166,54 +1166,341 @@ function renderPeriodBar() {
   });
 }
 
-// ============ FILE UPLOAD ============
+// ============ FILE UPLOAD (multi-format, multi-banque) ============
 document.getElementById('file-input').addEventListener('change', async e => {
-  const file = e.target.files[0];
-  if (!file) return;
-  try {
-    const buf = await file.arrayBuffer();
-    const wb = XLSX.read(buf, { type: 'array', cellDates: true });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, dateNF: 'yyyy-mm-dd' });
-    const txs = parseRows(rows);
-    if (txs.length < 2) {
-      showToast('Format non reconnu — vérifie le fichier');
-      return;
+  const files = Array.from(e.target.files || []);
+  if (!files.length) return;
+
+  const parsed = []; // {file, txs}
+  const errors = [];
+
+  for (const file of files) {
+    try {
+      const txs = await parseFileToTransactions(file);
+      if (txs && txs.length) parsed.push({ file: file.name, txs });
+      else errors.push(`${file.name} : format non reconnu`);
+    } catch (err) {
+      console.error(file.name, err);
+      errors.push(`${file.name} : erreur de lecture`);
     }
-    DATA.transactions = txs;
-    DATA.subscriptions = detectSubscriptions(txs);
-    txDisplayCount = 50;
-    saveData();
-    markCustom();
-    render();
-    showToast(`✓ ${txs.length} opérations chargées et sauvegardées`);
-  } catch (err) {
-    console.error(err);
-    showToast('Erreur de lecture du fichier');
   }
+
+  if (parsed.length === 0) {
+    showToast(errors[0] || 'Aucun fichier valide');
+    e.target.value = '';
+    return;
+  }
+
+  // First real import → on remplace les données de démo, ensuite on accumule
+  const wasFirstImport = !hasCustomData();
+  if (wasFirstImport) DATA.transactions = [];
+
+  const flat = parsed.flatMap(p => p.txs);
+  const { added, skipped } = mergeTransactions(flat);
+
+  DATA.transactions.sort((a, b) => b.date_op.localeCompare(a.date_op));
+  DATA.subscriptions = detectSubscriptions(DATA.transactions);
+  txDisplayCount = 50;
+  saveData();
+  markCustom();
+  render();
+
+  let msg = `✓ ${added} opération${added > 1 ? 's' : ''} ajoutée${added > 1 ? 's' : ''}`;
+  if (skipped) msg += ` · ${skipped} doublon${skipped > 1 ? 's' : ''} ignoré${skipped > 1 ? 's' : ''}`;
+  if (parsed.length > 1) msg += ` (${parsed.length} fichiers)`;
+  if (errors.length) msg += ` · ${errors.length} erreur${errors.length > 1 ? 's' : ''}`;
+  showToast(msg);
+  e.target.value = '';
 });
 
-function parseRows(rows) {
+async function parseFileToTransactions(file) {
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  const buf = await file.arrayBuffer();
+
+  if (ext === 'csv') {
+    // Try UTF-8 first; fall back to Latin-1 if mojibake
+    let text = new TextDecoder('utf-8').decode(buf);
+    if (text.indexOf('�') >= 0) {
+      try { text = new TextDecoder('iso-8859-1').decode(buf); } catch (_) {}
+    }
+    return parseCsvText(text, file.name);
+  }
+  // XLSX / XLS
+  const wb = XLSX.read(buf, { type: 'array', cellDates: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, dateNF: 'yyyy-mm-dd' });
+  return parseRowsAuto(rows, file.name);
+}
+
+// ----- CSV parser (RFC 4180, gère les guillemets) -----
+function csvParse(text) {
+  const rows = [];
+  let i = 0, field = '', row = [], inQ = false;
+  while (i < text.length) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') {
+        if (text[i+1] === '"') { field += '"'; i += 2; continue; }
+        inQ = false; i++;
+      } else { field += c; i++; }
+    } else {
+      if (c === '"') { inQ = true; i++; }
+      else if (c === ',') { row.push(field); field = ''; i++; }
+      else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; i++; }
+      else if (c === '\r') { i++; }
+      else { field += c; i++; }
+    }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// ----- Date FR : "3 juin 2025", "21 mars 2026", "21 mars 2026.", ISO, dd/mm/yyyy -----
+const FR_MONTHS = {
+  'janv':1,'janvier':1,'jan':1,
+  'fevr':2,'fev':2,'février':2,'fevrier':2,'févr':2,'fév':2,
+  'mars':3,'mar':3,
+  'avr':4,'avril':4,
+  'mai':5,
+  'juin':6,
+  'juil':7,'juillet':7,'jul':7,
+  'août':8,'aout':8,'aoû':8,'aou':8,
+  'sept':9,'sep':9,'septembre':9,
+  'oct':10,'octobre':10,
+  'nov':11,'novembre':11,
+  'déc':12,'dec':12,'décembre':12,'decembre':12
+};
+function parseFlexDate(s) {
+  if (!s) return null;
+  if (s instanceof Date) return s.toISOString().slice(0,10);
+  s = String(s).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0,10);
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) return `${m[3]}-${String(m[2]).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
+  m = s.toLowerCase().replace(/\./g,'').match(/^(\d{1,2})\s+([a-zûéàèïô]+)\s+(\d{4})$/i);
+  if (m) {
+    const mon = FR_MONTHS[m[2]];
+    if (mon) return `${m[3]}-${String(mon).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
+  }
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return d.toISOString().slice(0,10);
+  return null;
+}
+
+// ----- Montant en € : "1 100,00€", "-432,00 CZK (-17,69€)" → on prend la valeur EUR -----
+function parseEurAmount(s) {
+  if (s === null || s === undefined || s === '') return null;
+  if (typeof s === 'number') return s;
+  let str = String(s);
+  // Si entre parenthèses on a une conversion EUR, on la prend
+  const par = str.match(/\(([^)]*€)\)/);
+  if (par) str = par[1];
+  // Nettoyage : retirer codes ISO, €, espaces, normaliser virgule
+  str = str
+    .replace(/[A-Z]{2,4}\b/g, '')
+    .replace(/€/g, '')
+    .replace(/ /g, ' ')
+    .replace(/[^\d\-,.\s]/g, '')
+    .replace(/\s+/g, '')
+    .replace(',', '.');
+  const v = parseFloat(str);
+  return isNaN(v) ? null : v;
+}
+
+// ----- Dispatcher pour fichiers tabulaires (XLSX) -----
+function parseRowsAuto(rows, filename) {
+  if (!rows || !rows.length) return [];
+  // Boursorama : pas d'en-tête, première colonne = date ISO ou dd/mm/yyyy, ≥ 7 colonnes
+  const first = rows[0];
+  if (first && first.length >= 7) {
+    const d0 = first[0];
+    const isDate = (d0 instanceof Date) || (typeof d0 === 'string' && /^\d{4}-\d{2}-\d{2}|^\d{2}\/\d{2}\/\d{4}/.test(d0));
+    if (isDate) return parseBoursoramaRows(rows);
+  }
+  return parseGenericRows(rows, filename);
+}
+
+function parseBoursoramaRows(rows) {
   const out = [];
   for (const r of rows) {
-    if (!r || r.length < 5) continue;
-    // Skip header rows
-    const date = r[0];
-    if (!date || (typeof date === 'string' && !/\d{4}-\d{2}-\d{2}|\d{2}\/\d{2}\/\d{4}/.test(date))) continue;
-    const amt = parseFloat(String(r[6]||r[5]||0).replace(',','.'));
-    if (isNaN(amt)) continue;
+    if (!r || r.length < 7) continue;
+    const dateStr = parseFlexDate(r[0]);
+    if (!dateStr) continue;
+    const amt = parseEurAmount(r[6]);
+    if (amt === null) continue;
+    const desc = String(r[2] || '').trim();
+    const sub = String(r[3] || '').trim();
+    const cat = String(r[4] || 'Non catégorisé').trim();
+    const merchant = String(r[5] || '').trim();
+    const sourceBank = String(r[9] || '').trim() || 'BoursoBank';
     out.push({
-      date_op: typeof date === 'string' ? date.slice(0,10) : new Date(date).toISOString().slice(0,10),
-      description: r[2] || '',
-      sub_category: r[3] || '',
-      category: r[4] || 'Non catégorisé',
-      cat_smart: smartCat(r),
-      merchant: r[5] || '',
+      date_op: dateStr,
+      description: desc,
+      sub_category: sub,
+      category: cat,
+      cat_smart: smartCat([null, null, desc, sub, cat, merchant]),
+      merchant: merchant,
       amount: amt,
-      balance: parseFloat(String(r[8]||0).replace(',','.')) || 0
+      balance: parseEurAmount(r[10]) || 0,
+      source: sourceBank
     });
   }
   return out;
+}
+
+// ----- CSV : on essaie d'abord Revolut consolidé, sinon en-tête générique -----
+function parseCsvText(text, filename) {
+  const rows = csvParse(text);
+  // Revolut : présence de "Argent entrant/sortant" comme entête, ou "Relevé des transactions"
+  const isRevolut = rows.some(r => r && r.some(c =>
+    typeof c === 'string' && (
+      c === 'Argent entrant/sortant' ||
+      /Relevé des transactions/i.test(c) ||
+      /Comptes courants Récapitulatifs/i.test(c)
+    )
+  ));
+  if (isRevolut) return parseRevolutRows(rows, filename);
+  return parseGenericRows(rows, filename);
+}
+
+function parseRevolutRows(rows, filename) {
+  const out = [];
+  let inTable = false;
+  let bank = 'Revolut';
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r) continue;
+    // Capture du nom de banque
+    if (r[0] && /institution financi/i.test(String(r[0])) && r[1]) {
+      const inst = String(r[1]);
+      if (/revolut/i.test(inst)) bank = 'Revolut';
+      else if (/boursorama|bourso/i.test(inst)) bank = 'BoursoBank';
+      else if (/ing/i.test(inst)) bank = 'ING';
+      else bank = inst.split(/\s+/).slice(0, 2).join(' ');
+    }
+    // Début de table
+    if (String(r[0]).trim() === 'Date' && /description/i.test(String(r[1] || ''))) {
+      inTable = true; continue;
+    }
+    if (!inTable) continue;
+    const cell0 = String(r[0] || '').trim();
+    if (!cell0 || cell0.startsWith('-----')) { inTable = false; continue; }
+    const dateStr = parseFlexDate(cell0);
+    if (!dateStr) continue;
+    const desc = String(r[1] || '').trim();
+    const cat = String(r[2] || '').trim();
+    const amount = parseEurAmount(r[3]);
+    if (amount === null) continue;
+    out.push({
+      date_op: dateStr,
+      description: desc,
+      sub_category: cat || 'Non catégorisé',
+      category: revolutCategoryToCanonical(cat, amount),
+      cat_smart: smartCat([null, null, desc, cat, cat, desc]),
+      merchant: desc.toLowerCase().slice(0, 40),
+      amount: amount,
+      balance: parseEurAmount(r[4]) || 0,
+      source: bank
+    });
+  }
+  return out;
+}
+
+// Mappe les catégories Revolut FR vers les catégories canoniques utilisées par le dashboard
+function revolutCategoryToCanonical(cat, amount) {
+  const c = (cat || '').toLowerCase();
+  if (/recharg|prime|intér|interet|salaire/.test(c)) return 'Virements reçus';
+  if (/dab|retrait/.test(c)) return 'Retraits cash';
+  if (/change/.test(c)) return 'Services financiers & professionnels';
+  if (/commerç|commerc/.test(c)) return amount < 0 ? 'Vie quotidienne' : 'Virements reçus';
+  if (/autres/.test(c)) return amount > 0 ? 'Virements reçus' : 'Virements émis';
+  return cat || 'Non catégorisé';
+}
+
+// ----- CSV / XLSX générique avec en-tête -----
+function parseGenericRows(rows, filename) {
+  if (!rows.length) return [];
+  const lower = s => String(s || '').toLowerCase().trim();
+  let hdrIdx = -1;
+  for (let i = 0; i < Math.min(rows.length, 30); i++) {
+    const r = rows[i] || [];
+    const cells = r.map(lower);
+    const hasDate = cells.some(c => c === 'date' || c === 'date opération' || c === "date d'opération" || c === 'date op' || c === 'transaction date');
+    const hasAmt = cells.some(c => /(montant|amount|argent|valeur|d[ée]bit|cr[ée]dit)/.test(c));
+    if (hasDate && hasAmt) { hdrIdx = i; break; }
+  }
+  if (hdrIdx < 0) return [];
+  const headers = rows[hdrIdx].map(lower);
+  const find = (...kws) => headers.findIndex(c => kws.some(k => c === k || c.includes(k)));
+  const idxDate = find('date');
+  const idxDesc = find('libell', 'description', 'détails', 'details', 'memo', 'narration');
+  const idxAmt  = find('montant', 'amount', 'argent', 'valeur');
+  const idxDeb  = find('débit', 'debit');
+  const idxCre  = find('crédit', 'credit');
+  const idxBal  = find('solde', 'balance');
+  const idxCat  = find('catégorie', 'categorie', 'category');
+
+  const baseSource = filename.replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ').slice(0, 30);
+  const out = [];
+  for (let i = hdrIdx + 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r || !r.length) continue;
+    const dateStr = parseFlexDate(r[idxDate]);
+    if (!dateStr) continue;
+    let amt = null;
+    if (idxAmt >= 0) amt = parseEurAmount(r[idxAmt]);
+    if (amt === null && (idxDeb >= 0 || idxCre >= 0)) {
+      const d = parseEurAmount(idxDeb >= 0 ? r[idxDeb] : null) || 0;
+      const c = parseEurAmount(idxCre >= 0 ? r[idxCre] : null) || 0;
+      amt = c - Math.abs(d);
+    }
+    if (amt === null || isNaN(amt)) continue;
+    const desc = String(r[idxDesc] || '').trim();
+    const cat = idxCat >= 0 ? String(r[idxCat] || 'Non catégorisé').trim() : 'Non catégorisé';
+    out.push({
+      date_op: dateStr,
+      description: desc,
+      sub_category: cat,
+      category: cat,
+      cat_smart: smartCat([null, null, desc, cat, cat, desc]),
+      merchant: desc.toLowerCase().slice(0, 40),
+      amount: amt,
+      balance: idxBal >= 0 ? (parseEurAmount(r[idxBal]) || 0) : 0,
+      source: baseSource
+    });
+  }
+  return out;
+}
+
+// ----- Fusion + déduplication (multi-set : préserve les vrais doublons légitimes) -----
+function txKey(t) {
+  const desc = (t.description || '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 60);
+  const amt = Number(t.amount || 0).toFixed(2);
+  return `${t.date_op}|${desc}|${amt}|${t.source || ''}`;
+}
+function mergeTransactions(newTxs) {
+  // On compte combien de fois chaque signature apparaît déjà dans DATA.
+  // Quand un nouveau tx arrive, on consomme un "ticket" existant : si pas de ticket → vraie nouveauté → on ajoute.
+  // Permet d'importer 2 fois le même fichier sans doublonner, tout en gardant les vraies répétitions
+  // (ex: 6 retraits identiques le même jour).
+  const counters = new Map();
+  for (const t of DATA.transactions) {
+    const k = txKey(t);
+    counters.set(k, (counters.get(k) || 0) + 1);
+  }
+  let added = 0, skipped = 0;
+  for (const t of newTxs) {
+    const k = txKey(t);
+    const c = counters.get(k) || 0;
+    if (c > 0) {
+      counters.set(k, c - 1);
+      skipped++;
+    } else {
+      DATA.transactions.push(t);
+      added++;
+    }
+  }
+  return { added, skipped };
 }
 
 function smartCat(r) {
